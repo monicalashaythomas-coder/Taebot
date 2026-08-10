@@ -2367,6 +2367,42 @@ class DriftDetector:
         return fired
 
     @staticmethod
+    def rebuild_reference_confidences(sd: "SymbolData", models: "SymbolModels",
+                                      symbol: str, window: int = 200) -> List[float]:
+        """v11 fix ported from risefall-bot after the same bug was found
+        live there and traced precisely: the walk-forward backtest's own
+        confidence array (computed by fitting a FRESH model per fold,
+        per_layer_weights always None at that point) is scored by a
+        fundamentally different, unlearned-weight process than live
+        trading uses (state.model_cache[s], which has its per_layer_
+        weights already set). Comparing that mismatched reference against
+        live confidence via PSI produces a persistent, non-settling
+        false-drift signal that has nothing to do with genuine market
+        drift -- this bot's own logs showed the identical signature
+        (PSI pinned 3.8-4.5 across 728 consecutive readings; any real
+        PSI > ~0.25 is already "major shift" by convention, and a
+        genuinely evolving signal wouldn't sit statically that high for
+        an entire session). Fixed by replaying recent ticks through
+        compute_features()/bayesian_fusion() using the model AS IT WILL
+        ACTUALLY BE SCORED LIVE (final per_layer_weights already set) --
+        genuinely comparable to what live confidence looks like the
+        moment trading resumes. See snapshot_reference()'s docstring for
+        the second, compounding half of this fix."""
+        prices = sd.prices()
+        if len(prices) <= window + 20 or models is None or not models.fitted:
+            return []
+        epochs = sd.epochs()
+        replay_sd = sd.slice_copy(len(prices) - window)
+        out = []
+        for i in range(len(prices) - window, len(prices)):
+            replay_sd.add_tick(int(epochs[i]), float(prices[i]))
+            f = compute_features(replay_sd, models, {symbol: replay_sd.returns()})
+            if f is not None:
+                _, conf = bayesian_fusion(f)
+                out.append(conf)
+        return out
+
+    @staticmethod
     def snapshot_reference(state: "TradeState", symbol: str,
                            returns: np.ndarray, confidences: List[float]):
         """Call after each calibration to reset the reference distributions."""
@@ -2374,6 +2410,18 @@ class DriftDetector:
         state.drift_reference_returns[f"conf_{symbol}"] = np.array(confidences[-200:])
         state.cusum_stat[symbol]   = 0.0
         state.drift_degraded[symbol] = False
+        # v11 fix (ported from risefall-bot): this never used to clear
+        # drift_confidence_history[symbol] -- that deque (maxlen=200) is
+        # what PSI compares AGAINST the fresh reference above as "actual"/
+        # live, but without clearing it here it kept accumulating
+        # confidence values across calibration boundaries, mixing pre-
+        # and post-calibration regimes into a single "live" sample
+        # compared against a reference that only reflects the newest one.
+        # Combined with the confidence-scoring mismatch fixed via
+        # rebuild_reference_confidences() above, this was a second,
+        # compounding contributor to PSI staying persistently, artificially
+        # elevated.
+        state.drift_confidence_history[symbol].clear()
         print(f"[Drift] {symbol}: reference snapshot saved "
               f"({len(returns[-500:])} returns, {len(confidences[-200:])} conf scores)")
 
@@ -4170,9 +4218,15 @@ async def deep_startup_calibration(state, symbol_data, symbols):
         if sd is None:
             continue
 
+        # v11 fix (ported from risefall-bot): see DriftDetector.rebuild_
+        # reference_confidences()'s docstring for the full writeup of why
+        # this replaces reusing report.get("all_confidences", []) here.
+        reference_confs = await asyncio.to_thread(
+            DriftDetector.rebuild_reference_confidences, sd, models, s)
+
         # 1. Drift detector: snapshot training distribution as new reference
         train_returns = sd.returns()
-        oos_confs     = report.get("all_confidences", [])
+        oos_confs = reference_confs if reference_confs else report.get("all_confidences", [])
         DriftDetector.snapshot_reference(state, s, train_returns, oos_confs)
 
         # 2. Confidence calibration: fit temperature + isotonic from OOS data
@@ -4254,6 +4308,24 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
                         for k in all_keys
                     }
             state.model_cache[s] = models
+
+            # v11 fix (ported from risefall-bot): run_calibration() never
+            # called DriftDetector.snapshot_reference() at all before --
+            # only deep_startup_calibration() (meant to run once at
+            # genuine process start) did. Since run_calibration() is the
+            # path that actually fires often (scheduled + drift-
+            # triggered), the PSI drift reference was effectively frozen
+            # at whatever it was set to on the very first startup run and
+            # never refreshed again, even as per_layer_weights kept
+            # adapting on every subsequent cycle -- compounding the
+            # reference/live scoring mismatch further with each
+            # recalibration instead of correcting it. See DriftDetector.
+            # rebuild_reference_confidences()'s docstring for the full
+            # writeup of the underlying mismatch this fixes.
+            reference_confs = await asyncio.to_thread(
+                DriftDetector.rebuild_reference_confidences, sd, models, s)
+            oos_confs = reference_confs if reference_confs else confidences
+            DriftDetector.snapshot_reference(state, s, sd.returns(), oos_confs)
 
             # v9: same parallel minute-bar model fit as deep_startup_
             # calibration -- keeps the minute-native gate pipeline's
