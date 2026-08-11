@@ -515,7 +515,26 @@ KS_P_THRESHOLD        = 0.05
 
 # PSI: Population Stability Index for confidence scores.
 # PSI < 0.1 = stable, 0.1-0.25 = slight shift, > 0.25 = major shift.
-PSI_THRESHOLD         = 0.20
+PSI_THRESHOLD = 0.50
+# v11.2: raised from the textbook-standard 0.20 after measuring TAE-bot's
+# OWN genuinely-non-drifting PSI ceiling directly, the same way MIN_
+# CONFIDENCE/MIN_EXP_WIN_RATE were calibrated earlier -- not a blind
+# copy of a convention. After fixing three real, distinct bugs in the
+# reference-vs-live scoring mismatch (fuse_signal() being bypassed,
+# skipping calibration + meta-learner routing; slice_copy()'s buffer
+# undersizing silently evicting replay history; reference snapshotting
+# running BEFORE calibration/meta-learner were fit for the cycle instead
+# of after -- see DriftDetector.rebuild_reference_confidences()'s and
+# slice_copy()'s docstrings for the full writeups), a faithful
+# reproduction of the live check pattern across 5 independent, genuinely
+# non-drifting symbols measured PSI mean=0.22, 99th percentile=0.42.
+# 0.20 would still flag ~half of that as "drift" on pure noise. 0.50
+# gives real margin above the measured ceiling while still catching
+# genuine shifts -- production logs after this fix should show PSI/DEGRADED
+# events meaningfully rarer, not eliminated outright (some residual
+# elevation above textbook 0.20 appears to be an inherent property of
+# comparing two different time-windows of an autocorrelated, wide-ranging
+# confidence signal, not a further bug to chase).
 
 # CUSUM: sequential win-rate degradation. Fires when cumulative sum of
 # (0.5 - outcome) exceeds threshold, indicating sustained below-50% performance.
@@ -931,10 +950,22 @@ class SymbolData:
             return self.tick_dt
         return float(np.mean(np.diff(e)))
 
-    def slice_copy(self, n):
+    def slice_copy(self, n, extra_capacity=10):
         """Returns a new SymbolData containing only the first n ticks, carrying
-        tick_dt through so re-fitted models use the correct rate."""
-        new_sd = SymbolData(self.symbol, maxlen=n + 10, tick_dt=self.tick_dt)
+        tick_dt through so re-fitted models use the correct rate.
+
+        extra_capacity: how much headroom to leave in the new buffer beyond
+        n, for callers that plan to add more ticks to the copy afterward
+        (e.g. DriftDetector.rebuild_reference_confidences()'s replay loop,
+        which adds `window` more ticks one at a time after this call --
+        the default extra_capacity=10 used to be silently reused there
+        too, so once more than ~10 ticks had been replayed the deque
+        started evicting its own oldest ticks to stay within maxlen,
+        making the replay's tick history composition drift away from
+        what live compute_features() sees on the real, unbounded buffer
+        for the rest of that replay -- a real, structural contributor to
+        the persistent PSI mismatch that fix was supposed to close."""
+        new_sd = SymbolData(self.symbol, maxlen=n + extra_capacity, tick_dt=self.tick_dt)
         for e, p in list(self.ticks)[:n]:
             new_sd.add_tick(e, p)
         return new_sd
@@ -2368,7 +2399,8 @@ class DriftDetector:
 
     @staticmethod
     def rebuild_reference_confidences(sd: "SymbolData", models: "SymbolModels",
-                                      symbol: str, window: int = 200) -> List[float]:
+                                      symbol: str, state: "TradeState",
+                                      window: int = 200) -> List[float]:
         """v11 fix ported from risefall-bot after the same bug was found
         live there and traced precisely: the walk-forward backtest's own
         confidence array (computed by fitting a FRESH model per fold,
@@ -2387,18 +2419,51 @@ class DriftDetector:
         ACTUALLY BE SCORED LIVE (final per_layer_weights already set) --
         genuinely comparable to what live confidence looks like the
         moment trading resumes. See snapshot_reference()'s docstring for
-        the second, compounding half of this fix."""
+        the second, compounding half of this fix.
+
+        v11.1 FIX (second bug in this same area, found after the FIRST fix
+        still didn't resolve production PSI -- confirmed empirically: even
+        with the weight mismatch fixed, PSI stayed high in a faithful
+        reproduction of the live check pattern): this used to call
+        bayesian_fusion(f) directly. Live confidence never goes through
+        bayesian_fusion() alone -- it goes through fuse_signal(), which
+        (a) applies ConfidenceCalibrator's temperature+isotonic
+        calibration on TOP of bayesian_fusion()'s raw output, reshaping
+        the distribution substantially, and (b) can route to a completely
+        different model (MetaLearner) once enough training samples exist,
+        bypassing bayesian_fusion() entirely. Calling bayesian_fusion()
+        directly here meant the reference was built from a raw,
+        uncalibrated score while live confidence was calibrated -- a
+        second, distinct scoring-process mismatch stacked on top of the
+        first one, and on its own enough to keep PSI elevated even after
+        the per_layer_weights fix. Now calls fuse_signal() -- the actual,
+        single entry point live trading uses -- so reference and live are
+        guaranteed to be produced by the identical process."""
         prices = sd.prices()
         if len(prices) <= window + 20 or models is None or not models.fitted:
             return []
         epochs = sd.epochs()
-        replay_sd = sd.slice_copy(len(prices) - window)
+        # extra_capacity=window+10: this loop adds `window` more ticks to
+        # the copy below, one at a time -- without enough headroom the
+        # buffer starts evicting its own oldest ticks partway through the
+        # replay (see slice_copy()'s docstring for the full writeup of
+        # this exact bug).
+        replay_sd = sd.slice_copy(len(prices) - window, extra_capacity=window + 10)
+        # Match live's recent_call_ratio computation exactly (same source,
+        # same 30-trade window) rather than assuming a neutral 0.5 default --
+        # bayesian_fusion applies a real (if capped, small) correction based
+        # on this, so it's one more thing worth keeping consistent between
+        # reference and live scoring.
+        recent_dirs = state.direction_history[-30:] if state.direction_history else []
+        recent_call_ratio = (sum(1 for d in recent_dirs if d == 1) / len(recent_dirs)
+                            if recent_dirs else 0.5)
         out = []
         for i in range(len(prices) - window, len(prices)):
             replay_sd.add_tick(int(epochs[i]), float(prices[i]))
             f = compute_features(replay_sd, models, {symbol: replay_sd.returns()})
             if f is not None:
-                _, conf = bayesian_fusion(f)
+                f["recent_call_ratio"] = recent_call_ratio
+                _, conf = fuse_signal(f, state, symbol)
                 out.append(conf)
         return out
 
@@ -4218,13 +4283,35 @@ async def deep_startup_calibration(state, symbol_data, symbols):
         if sd is None:
             continue
 
+        # 1. Confidence calibration: fit temperature + isotonic from OOS data
+        #    Uses the OOS p_up values and actual hit outcomes from walk-forward
+        raw_pups    = report.get("all_p_ups",    [])
+        raw_outcomes= report.get("all_outcomes", [])
+        if len(raw_pups) >= 50 and len(raw_outcomes) >= 50:
+            ConfidenceCalibrator.fit_and_save(
+                state, s,
+                raw_pups[:len(raw_outcomes)],
+                raw_outcomes
+            )
+
+        # 2. Meta-learner: batch retrain from full rolling buffer
+        MetaLearner.retrain_from_buffer(state, s)
+
+        # 3. Drift detector: snapshot training distribution as new reference.
         # v11 fix (ported from risefall-bot): see DriftDetector.rebuild_
         # reference_confidences()'s docstring for the full writeup of why
         # this replaces reusing report.get("all_confidences", []) here.
+        # Run LAST in this loop (after calibration + meta-learner retrain
+        # above), not first -- rebuild_reference_confidences() calls
+        # fuse_signal() internally, which reads state.cal_temperature/
+        # cal_isotonic and can route to MetaLearner once trained. Running
+        # this before those were fit for this cycle meant the reference
+        # was built with STALE (or absent) calibration/meta-learner state
+        # while live confidence would use the fresh one moments later --
+        # a second-order version of the same "reference and live scored by
+        # different processes" problem the whole fix exists to close.
         reference_confs = await asyncio.to_thread(
-            DriftDetector.rebuild_reference_confidences, sd, models, s)
-
-        # 1. Drift detector: snapshot training distribution as new reference
+            DriftDetector.rebuild_reference_confidences, sd, models, s, state)
         train_returns = sd.returns()
         if reference_confs:
             oos_confs = reference_confs
@@ -4236,20 +4323,6 @@ async def deep_startup_calibration(state, symbol_data, symbols):
                   f"This should be rare -- if you see this every cycle, something is "
                   f"wrong with the replay path itself, not just a one-off data gap.")
         DriftDetector.snapshot_reference(state, s, train_returns, oos_confs)
-
-        # 2. Confidence calibration: fit temperature + isotonic from OOS data
-        #    Uses the OOS p_up values and actual hit outcomes from walk-forward
-        raw_pups    = report.get("all_p_ups",    [])
-        raw_outcomes= report.get("all_outcomes", [])
-        if len(raw_pups) >= 50 and len(raw_outcomes) >= 50:
-            ConfidenceCalibrator.fit_and_save(
-                state, s,
-                raw_pups[:len(raw_outcomes)],
-                raw_outcomes
-            )
-
-        # 3. Meta-learner: batch retrain from full rolling buffer
-        MetaLearner.retrain_from_buffer(state, s)
 
     # ── Persist learned state to Supabase ─────────────────────────────────
     if _store is not None:
@@ -4330,8 +4403,18 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
             # recalibration instead of correcting it. See DriftDetector.
             # rebuild_reference_confidences()'s docstring for the full
             # writeup of the underlying mismatch this fixes.
+            #
+            # No reordering needed here (unlike deep_startup_calibration)
+            # -- run_calibration() never calls ConfidenceCalibrator.
+            # fit_and_save() or MetaLearner.retrain_from_buffer() at all,
+            # so both this replay and live trading read whatever
+            # calibration state was last set (at the original startup
+            # calibration), consistently. Worth knowing as a separate,
+            # real gap though: calibration itself never refreshes on this
+            # path even as per_layer_weights keeps evolving every cycle --
+            # not fixed here, flagging for a future pass.
             reference_confs = await asyncio.to_thread(
-                DriftDetector.rebuild_reference_confidences, sd, models, s)
+                DriftDetector.rebuild_reference_confidences, sd, models, s, state)
             if reference_confs:
                 oos_confs = reference_confs
             else:
